@@ -1,9 +1,8 @@
 # The jitter wall — and the lever that beats it
 
-Knowing the limit of your hardware is as valuable as the result. This page documents the
-~1 ms reception-timestamp jitter that bounds the raw measurement, the experiments that
-identified its cause and ruled out the tempting fixes, and the one estimator insight that
-recovers ~5 µs precision from underneath it.
+This page documents the ~1 ms reception-timestamp jitter that bounds the raw measurement, the
+experiments that identified its cause and ruled out the tempting fixes, and the estimator
+insight that recovers a few-µs relative sync from underneath it.
 
 ## The wall: ~0.7–1.3 ms of RX jitter
 
@@ -50,7 +49,7 @@ Before accepting the wall, we tried the obvious mitigations. None moved it:
 
 The conclusion: **~1 ms is a hard ESP32 app-layer coex floor.** Getting under it would
 require a link-layer / controller RX timestamp — a deep, uncertain dig into ESP-IDF / the
-BT controller that our research left inconclusive. The honest engineering call was to treat
+BT controller that our research left inconclusive. So we treat
 ~1 ms as fixed and win at the *estimator* instead. (If a future firmware ever exposes an LL
 timestamp, the resolver benefits automatically with no design change.)
 
@@ -79,21 +78,19 @@ offset — which **cancels in the TDOA pairwise difference** anyway.
 | Tightest 30% | 291 µs (prototype) |
 | Tightest 20% | 224 µs (prototype) |
 | Tightest 10% | 168 µs (prototype) |
-| Live resolver, 30%, std-honest | **359 µs** (`sigma_clean`; the MAD-median is ~103 µs but ignores the one-sided tail) |
+| Live resolver, 30%, std | **359 µs** (`sigma_clean`; the MAD-median is ~103 µs — the median discards the one-sided tail) |
 
 That is a **~1.8× precision gain** over using all flashes — purely from selecting
 near-floor samples instead of averaging. The live system keeps the cleanest 30%
 (`TIGHTNESS_KEEP_FRAC = 0.30`, `TIGHTNESS_MIN_FLASHES = 12`).
 
-## Why this matters more than chasing the firmware fix
+## Estimator vs. firmware fix
 
-The instinct is to fix the measurement (get the LL timestamp, kill the 1 ms). That path is
-deep, uncertain, and may not exist on this silicon. The estimator path — recognize the noise
-is one-sided, minimum-filter it, fold the constant bias into a per-node offset that cancels
-in TDOA — is *free*, robust, and got us to the usable 8 cm / 1° spec. **The lesson is to
-characterize your noise distribution before choosing your estimator.** A symmetric-Gaussian
-assumption would have left a factor of ~1.8 on the table and pointed all the effort at the
-wrong layer.
+Fixing the measurement (getting an LL timestamp, killing the 1 ms) is deep, uncertain, and
+may not exist on this silicon. The estimator path — recognize the noise is one-sided,
+minimum-filter it, fold the constant bias into a per-node offset that cancels in the pairwise
+difference — is free, robust, and gets the few-µs relative sync. A symmetric-Gaussian
+assumption would have left the ~1.8× on the table and pointed the effort at the wrong layer.
 
 ## See also
 

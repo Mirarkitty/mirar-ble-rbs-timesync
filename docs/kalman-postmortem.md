@@ -171,7 +171,7 @@ mechanisms shipped *with* it, all of which fired correctly.
 3. **Shadow dual-estimator logging** — both estimators ingest the same stream; per tick, per
    node, log `pred_offset` (prediction *before* the update), `measured_offset`,
    `pred_residual`, and which estimator is `active`. This is what made the A/B possible at
-   all — and `pred_residual` is the only metric that honestly ranks the two.
+   all — and `pred_residual` is the only metric that meaningfully ranks the two.
 
 ## Summary of lessons
 

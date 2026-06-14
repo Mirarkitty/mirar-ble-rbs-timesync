@@ -1,61 +1,51 @@
-# Live results — reboot → convergence → precision
+# Live results
 
-![Convergence curve](convergence.png)
+Both figures are captured from the running fleet on 2026-06-14 and are reproducible from the
+included data and scripts.
 
-This is a **live capture from the running fleet** (2026-06-14): one ESP32-S3 node was
-rebooted while the resolver logged its per-node clock state every 2 s. It shows the full
-lifecycle of a node's clock model from a cold reboot to usable precision.
+## Fleet sync residual
 
-## Reading the graph
+![fleet residual](fleet_resid.png)
 
-| Phase | What you see | What's happening |
-|---|---|---|
-| `t < 0` | reported σ flat at ~124 µs, `valid=True` | The node's *previous* boot epoch, in steady state. |
-| `t = 0` (red line) | boot nonce changes (116 → 125) | **Reboot detected.** `esp_timer` reset to 0, model wiped: `n_flashes=0`, σ undefined, `valid=False`. |
-| `0 → ~64 s` (shaded) | no σ plotted, line broken | **Convergence window.** The offset is re-acquiring from scratch; `to_ref_us()` returns `None` so TDOA consumers correctly ignore the node. Drift, however, is **reboot-seeded** (`drift_seeded=True`) from the first instant. |
-| `~64 s` (dashed line) | σ appears (~378 µs spike), then `valid=True` | **Precision acquired.** Once ≥10 flashes accumulate, the node is exposed to consumers. |
-| `t > 64 s` | σ settles to **~100–115 µs** (median 113 µs) | Steady state. n_flashes plateaus at 12; drift refines toward the node's true slope. |
+Per-node relative-sync residual across all 14 nodes (`esp32h` is the gauge reference at
+offset 0 by definition; the other 13 are solved relative to it), over a 2-hour window:
 
-**Measured this run:**
-- Convergence to `valid`: **64 s** (within the 60–90 s design window).
-- Steady-state reported σ: **median 113 µs** (min 100, max 136).
-- `drift_seeded = True` on the new epoch — the reboot-seed feature confirmed live.
+- Per-node median: **4.6–7.7 µs**
+- Fleet median: **6.8 µs**
+- p90 markers: the one-sided BLE-reception jitter tail (~280–370 µs)
 
-## An important honesty note about the y-axis
+The median is the relative clock-prediction error a TDOA consumer sees; the p90 reflects the
+~1 ms app-layer jitter that minimum-filtering suppresses but cannot remove.
 
-The y-axis is the resolver's **reported per-node σ** (`sigma_us`), which floors around
-~100 µs (`MIN_REPORTED_SIGMA_US = 50 µs` is the hard floor; the clean-solve std lands
-~100 µs here). **This is not the same statistic as the ~5 µs headline.**
+Reproduce: `python3 plot_fleet.py fleet_resid.json fleet_resid.png`
+(`fleet_resid.json` is per-node median/p90 computed from the resolver's shadow log over the
+window.)
 
-- **~100–115 µs here** = reported σ, a std-based, conservative per-node uncertainty.
-- **~5 µs** (see [../docs/accuracy.md](../docs/accuracy.md)) = the *1-step prediction
-  residual*, a robust-median (MAD) metric of how well the model predicts the next
-  observation. Finer, and reported with the caveat that it ignores the one-sided tail.
-- **~8 cm range / ~1° bearing** = the std-honest TDOA spec you should actually design to.
+## Reboot → convergence → sub-100 µs
 
-They are three different, all-true numbers. This graph shows the **reported σ** because that
-is what the live status API exposes per node and what gates `valid`. We deliberately do not
-relabel it as the 5 µs figure.
+![convergence](convergence.png)
 
-## Reproducing this
+One node (`esp32s`) was rebooted while the resolver logged its per-tick prediction residual:
 
-```bash
-# 1. Log the live resolver while you reboot a node (needs network access to the fleet):
-python3 capture_convergence.py <node> convergence_capture.jsonl 260 2
-#    ...reboot the node via its HTTP /reboot or MQTT command...
+- Pre-reboot, the previous (settled) epoch sits at ~2.8 µs.
+- At reboot the epoch resets; for ~80 s `to_ref_us` returns `None` (shaded) while the offset
+  re-acquires from scratch. Drift is reboot-seeded correct from the first instant.
+- After lock, the cumulative-median residual stays well under 100 µs and settles into the
+  tens of µs, trending toward the fleet's few-µs steady state as more flashes accumulate.
 
-# 2. Plot:
-python3 plot_convergence.py convergence_capture.jsonl convergence.png
-```
+The per-tick scatter spans 1 µs to ~2 ms — that is the one-sided reception jitter; the
+cumulative median is the stable estimate beneath it.
 
-`convergence_capture.jsonl` (the raw capture behind this graph) is included. It contains only
-clock-model status fields — no MACs, IPs, or location data.
+Reproduce: `python3 plot_convergence.py esp32s_resid_raw.jsonl convergence.png`
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `convergence.png` | The graph above. |
-| `convergence_capture.jsonl` | Raw per-2 s capture (130 samples spanning the reboot). |
-| `capture_convergence.py` | Polls the resolver status API → JSONL. |
-| `plot_convergence.py` | JSONL → annotated convergence plot. |
+| `fleet_resid.png` / `fleet_resid.json` | Fleet bar chart + its per-node stats. |
+| `convergence.png` / `esp32s_resid_raw.jsonl` | Reboot curve + its raw per-tick residuals. |
+| `capture_convergence.py` | Polls the live resolver status API → JSONL (for the σ/validity view). |
+| `plot_fleet.py`, `plot_convergence.py` | Plot generators. |
+
+Data files contain only clock-model fields (residuals, drift, boot epoch) — no MACs, IPs, or
+location data.

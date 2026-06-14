@@ -1,134 +1,110 @@
 # ble-rbs-timesync
 
-**Sub-100 µs time synchronization across cheap ESP32-S3 nodes — over BLE, with no
-wire, no GPS, and no shared WiFi clock.**
+**Relative time synchronization across a fleet of cheap ESP32-S3 nodes — to a few
+microseconds — over BLE, with no wire, no GPS, and no shared WiFi clock.**
 
-This repository documents a working reference-broadcast time-sync (RBS) mesh built on
-commodity ESP32-S3 boards. It was built to enable **acoustic TDOA** (time-difference-of-arrival
-source localization) between microphone nodes that sit on *different WiFi access points* —
-so 802.11 TSF is not shared, ESP-NOW won't reach across channels, and there is no cabling
-between them.
+The nodes sit on different WiFi access points (different channels), so they share no
+802.11 TSF, ESP-NOW can't reach between them, and there's no cabling. They synchronize
+purely by overhearing each other's existing BLE advertisements.
 
-The interesting result: a fleet of ~14 sub-$10 radios, time-synced *only* by listening to
-each other's existing BLE advertisements, achieves a **relative clock-prediction floor of
-~5 µs** and a **TDOA-honest range-difference resolution of ~8 cm** — good enough for
-sub-degree acoustic bearings.
+## Result
 
-> **Status:** documentation / whitepaper first. This is a writeup of a system that runs
-> live. Code (the pure resolver, anonymized capture data for offline reproduction, and a
-> standalone ESP-IDF firmware component) is being extracted and will land in stages — see
-> [Roadmap](#roadmap).
+Across a live 13-node fleet, the **relative clock-prediction residual between nodes is
+4.6–7.7 µs (median 6.8 µs)** — measured over a 2-hour window against a chosen gauge node.
 
----
+![Per-node sync residual](results/fleet_resid.png)
 
-## The headline numbers (honest version)
+A node that reboots re-locks within ~80 s and its residual settles back into the
+single-to-tens-of-µs range as it re-accumulates flashes:
 
-There are **two** numbers, and good faith requires reporting both:
+![Reboot to sub-100µs](results/convergence.png)
 
-| Metric | Value | What it means |
-|---|---|---|
-| Raw BLE-RX jitter | **0.7–1.3 ms** | The hard wall — app-layer timestamp jitter on a shared-radio coex stack. Everything below is *recovered* from underneath this. |
-| Served 1-step prediction residual | **~5 µs median** (fleet-wide) | How well the model predicts the next observation. A *relative* clock-quality stat. |
-| Pairwise TDOA timing σ (std-honest) | **~235 µs** | The number that actually bounds localization. √2 × per-node residual std. |
-| Range-difference resolution | **~8 cm** | `c · σ_t`. **This is the usable spec.** |
-| Bearing resolution | **~1°** | At a ~5 m array aperture, near broadside. |
+Both graphs are live captures from the running fleet (2026-06-14), reproducible from the
+included data — see [results/](results/).
 
-**Why two numbers?** The ~5 µs figure is a robust-median (MAD) statistic of the one-step
-prediction residual — it is real, but it ignores the one-sided tail of the jitter
-distribution. The std-honest figure for what TDOA can actually resolve is ~8 cm. We lead
-with 8 cm because that is the spec you can build on; the 5 µs is the *relative* clock floor,
-reported with its caveat. See [docs/accuracy.md](docs/accuracy.md).
+These are **relative** figures between nodes, which is all that matters for the target
+application (acoustic time-difference-of-arrival): there is no shared absolute clock and
+none is needed.
 
-If you have seen this project described as "5 µs / 1.7 mm" — that is the optimistic relative
-figure. The number you should quote in a real design is **8 cm range / 1° bearing.**
+## How it works
 
----
+Every node already BLE-advertises its identity ~every 1.5 s (for an unrelated positioning
+system). We piggyback a 64-bit hardware-timer timestamp (`tx_us`, restamped faster than the
+advertising interval) plus a random per-boot epoch tag into the advertisement's manufacturer
+field. Every *other* node that hears that single emission stamps it with its own hardware
+timer (`rx_us`).
 
-## How it works in one paragraph
+Because all receivers time the **same emission**, the unknown BLE air-time and the mandatory
+0–10 ms advertising delay are a **common offset that cancels** in pairwise receiver
+differences `rx_i − rx_j`. What remains is exactly the inter-node clock offset and drift.
+A server collects these reports, solves per-node offset + drift relative to one gauge node,
+and exposes `to_ref_us(node, local_us)`.
 
-Every node already BLE-advertises its identity ~every 1.5 s (for an unrelated RSSI
-positioning system). The firmware piggybacks a 64-bit hardware-timer timestamp (`tx_us`,
-restamped faster than the advertising interval) plus a random per-boot epoch tag into the
-advertisement's manufacturer field. Every *other* node that hears that single emission
-stamps it with its own hardware timer (`rx_us`). Because all receivers time the **same
-emission**, the unknown BLE air-time and the mandatory 0–10 ms advertising delay are a
-**common offset that cancels** when you take pairwise receiver differences `rx_i − rx_j`.
-What remains is exactly the inter-node clock offset and drift — which is all TDOA needs.
-A server collects these reports, solves per-node offset+drift, and exposes a
-`to_ref_us(node, local_us)` mapping. Full detail: [docs/how-it-works.md](docs/how-it-works.md).
+This is classic Reference-Broadcast Synchronization (Elson, Girod & Estrin, OSDI 2002). The
+work here is making it reach a few µs *underneath the ESP32's coex hardware*. Full mechanism:
+[docs/how-it-works.md](docs/how-it-works.md).
 
----
+## Working around the hardware
 
-## What's genuinely novel / worth reading
+The raw obstacle is a **~1 ms reception-timestamp jitter**. The receive time is stamped in an
+app-layer NimBLE callback that fires *at or after* the radio RX — and on the ESP32-S3 the BT
+controller, NimBLE host, and WiFi all share one core and one 2.4 GHz radio via software
+coexistence. Standard NimBLE exposes no link-layer RX timestamp, so ~1 ms is a hard floor at
+the application layer. Pinning the host to a second core and changing coex preference both
+made no difference.
 
-1. **The jitter is one-sided, so minimum-filtering beats averaging.** The BLE-reception
-   timestamp is taken in an app-layer callback that fires *at or after* the radio RX, never
-   before. So the noise is one-sided (`delay ≥ 0`). NTP-style "keep the tightest flashes"
-   selection is a **1.8× precision win** over √(k−1) averaging, which wrongly assumes
-   symmetric Gaussian noise. See [docs/jitter-wall.md](docs/jitter-wall.md).
+Two moves get from a 1 ms jitter floor to a few-µs relative sync:
 
-2. **We built a Kalman filter, deployed it safely, and the data killed it.** A 2-state
-   EKF (offset + drift) is the textbook answer. We shipped it behind a runtime kill-switch,
-   an auto-guard, and dual-estimator shadow logging — then ran a 2.8-hour live A/B across 13
-   nodes. The simple "tightest-flash + persisted drift" predictor beat it by **~30×** in
-   steady state (5 µs vs 155 µs) and even won at gap-exits. The Kalman's whole premise —
-   coasting through long silences — never paid off because every coverage gap was ~15 s.
-   The full post-mortem, including two divergence failures and the decoupled-scalar fix, is
-   the most reusable lesson here: [docs/kalman-postmortem.md](docs/kalman-postmortem.md).
+1. **The jitter is one-sided** (`delay ≥ 0`), so we don't average — we **minimum-filter**.
+   Keeping only the cleanest ~30 % of flashes (the ones where every receiver got prompt
+   delivery) is a ~1.8× precision win over `√(k−1)` averaging, which would wrongly assume
+   symmetric noise. The constant floor-delay folds into a per-node offset that cancels in the
+   pairwise difference anyway. → [docs/jitter-wall.md](docs/jitter-wall.md)
 
-3. **~1 ms is a hard ESP32 app-layer coex floor.** We document the experiments that ruled
-   out CPU contention and radio-preference, and explain why sub-100 µs would require a
-   link-layer RX timestamp that standard NimBLE does not expose. Knowing the wall is as
-   valuable as the result. [docs/jitter-wall.md](docs/jitter-wall.md).
+2. **Per-node drift persistence** coasts the model through the ~15 s BLE/WiFi coex blackouts
+   and seeds a correct drift the instant a rebooted node reappears. This replaced a Kalman
+   filter, which lost a live A/B by ~30× — its only advantage (long-gap coasting) never
+   materializes because every gap is ~15 s. → [docs/kalman-postmortem.md](docs/kalman-postmortem.md)
 
----
+## What it's for
 
-## Repository layout (target)
+Acoustic source localization by time-difference-of-arrival across microphone nodes. With a
+few-µs relative sync and a ~5 m array aperture, the downstream geometry gives near-field 3-D
+position and ~1° bearing on far sources; range becomes unobservable past a few tens of
+metres. The sync layer (this project) and the TDOA geometry layer are cleanly separated.
+Details and the full budget: [docs/accuracy.md](docs/accuracy.md).
+
+## Repository layout
 
 ```
-ble-rbs-timesync/
-├── README.md                  ← you are here
-├── docs/
-│   ├── how-it-works.md        ← RBS principle, common-offset cancellation, the resolver
-│   ├── accuracy.md            ← TDOA budget; what TDOA can and cannot do; the two numbers
-│   ├── jitter-wall.md         ← the ~1 ms coex floor; ruled-out causes; min-filter lever
-│   └── kalman-postmortem.md   ← design, divergence ×2, decoupled fix, live A/B retirement
-├── rbs/                       ← [roadmap] pure Python resolver (numpy + stdlib only)
-├── data/                      ← [roadmap] anonymized real captures (offline reproduction)
-├── examples/                  ← [roadmap] replay.py, jitter_analysis.py
-└── components/rbs_tsync/      ← [roadmap] standalone ESP-IDF firmware component
+README.md
+docs/
+  how-it-works.md     RBS principle, common-offset cancellation, the resolver
+  accuracy.md         sync-quality results, drift, the TDOA budget
+  jitter-wall.md      the ~1 ms coex floor and the one-sided min-filter that beats it
+  kalman-postmortem.md  EKF design, the divergence, the decoupled fix, the live A/B
+results/              live fleet + reboot-convergence captures, plots, and scripts
 ```
 
-## Roadmap
+> **Status:** documentation and results first. The implementation code (the dependency-free
+> resolver, an offline replay that reproduces these numbers, and a standalone ESP-IDF
+> firmware component) is being extracted and will land in stages.
 
-- [x] **Phase 0 — Documentation / whitepaper** (this commit): the technique, the honest
-      accuracy budget, the jitter wall, the Kalman post-mortem.
-- [x] **Live result — reboot → precision convergence graph** (captured 2026-06-14 from the
-      running fleet): see [results/](results/). A real node rebooting, re-acquiring its
-      offset from scratch in 64 s, with drift reboot-seeded.
-- [ ] **Phase 1 — Pure core + reproducible demo**: extract the dependency-free resolver,
-      ship anonymized capture files, and a `replay.py` that reproduces every number in
-      these docs **with zero hardware**. (Unit tests already exist upstream.)
-- [ ] **Phase 2 — Standalone firmware component**: extract announce-restamp + RX-stamp +
-      ring/drain into a clean ESP-IDF component with a minimal example app.
-- [ ] **Phase 3 — Serving adapter**: a generic MQTT/stdin runner (no project framework
-      coupling) exposing `to_ref_us()` plus the kill-switch / auto-guard / shadow-log infra.
+## Hardware
 
-## Hardware this was validated on
-
-- ESP32-S3-N16R8 (16 MB flash, 8 MB octal PSRAM), ~14 nodes
-- NimBLE stack, active+passive scan, WiFi+BLE software coexistence on a single 2.4 GHz radio
-- Nodes split across two different-channel WiFi APs (the reason TSF sync was unavailable)
+- ESP32-S3-N16R8 (16 MB flash, 8 MB octal PSRAM), 13–14 nodes
+- NimBLE, active + passive scan, WiFi + BLE software coexistence on one 2.4 GHz radio
+- Nodes split across two different-channel WiFi APs (why no shared TSF was available)
+- Sync clock is `esp_timer_get_time()` (hardware µs); device clocks are never disciplined —
+  the model lives entirely on the server
 
 ## License
 
-TBD before public release (MIT or Apache-2.0 recommended). Capture data will be anonymized
-(no MACs, IPs, or location-linked RSSI) before Phase 1.
+MIT (see [LICENSE](LICENSE)).
 
 ## Acknowledgements
 
-Built as the timing layer of a home BLE positioning + acoustic source-tracking system.
-The reference-broadcast principle is classic (Elson, Girod & Estrin, OSDI 2002); the
-contribution here is making it work *underneath* a 1 ms app-layer jitter wall on commodity
-coex hardware, and the empirical finding that minimum-filtering + drift persistence beats a
-Kalman filter in this regime.
+The reference-broadcast principle is from Elson, Girod & Estrin, *Fine-Grained Network Time
+Synchronization using Reference Broadcasts* (OSDI 2002). The contribution here is reaching a
+few-µs relative sync on commodity coex hardware, and the result that minimum-filtering plus
+drift persistence outperforms a Kalman filter in this regime.
