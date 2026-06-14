@@ -1,0 +1,30 @@
+menu "rbs_tsync example"
+
+config EXAMPLE_NODE_LETTER
+    string "Node letter (1 char, unique per board)"
+    default "a"
+
+config EXAMPLE_NODE_ID
+    string "Node id (report 'node' field + topic suffix)"
+    default "esp32a"
+
+config EXAMPLE_USE_WIFI
+    bool "Publish over WiFi/MQTT (else print reports to UART)"
+    default n
+
+config EXAMPLE_WIFI_SSID
+    string "WiFi SSID"
+    depends on EXAMPLE_USE_WIFI
+    default "myssid"
+
+config EXAMPLE_WIFI_PASSWORD
+    string "WiFi password"
+    depends on EXAMPLE_USE_WIFI
+    default "mypassword"
+
+config EXAMPLE_MQTT_URI
+    string "MQTT broker URI"
+    depends on EXAMPLE_USE_WIFI
+    default "mqtt://192.168.1.10"
+
+endmenu

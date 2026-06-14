@@ -83,12 +83,42 @@ docs/
   accuracy.md         sync-quality results, drift, the TDOA budget
   jitter-wall.md      the ~1 ms coex floor and the one-sided min-filter that beats it
   kalman-postmortem.md  EKF design, the divergence, the decoupled fix, the live A/B
+  integration.md      consuming to_ref_us (live vs offline), drift OLS, reboot handling
+rbs/                  Python server: resolver, service, MQTT runner, perf report
+  resolver.py  service.py  run.py  report.py
+tests/                pytest (12) against the resolver + a real capture
+examples/replay.py    offline replay — reproduces the numbers with no hardware
+data/capture_v4.jsonl anonymized real tsync_rx capture
+firmware/
+  components/rbs_tsync/   standalone ESP-IDF component (announce + scan + report)
+  example/                buildable two-board demo (MQTT or UART output)
 results/              live fleet + reboot-convergence captures, plots, and scripts
 ```
 
-> **Status:** documentation and results first. The implementation code (the dependency-free
-> resolver, an offline replay that reproduces these numbers, and a standalone ESP-IDF
-> firmware component) is being extracted and will land in stages.
+> **Status:** runnable. The Python server (`rbs/`) and the ESP-IDF firmware component
+> (`firmware/`) are both extracted and building; offline replay reproduces the numbers
+> with no hardware. See [Quick start](#quick-start).
+
+## Quick start
+
+**Server, no hardware** — reproduce the numbers from the included capture:
+```bash
+pip install -r requirements.txt
+python examples/replay.py            # per-node offset/drift + σ_all 658µs → σ_clean 359µs
+pytest -q                            # 12 tests
+```
+
+**Server, live** — resolve a real fleet off an MQTT broker and report performance:
+```bash
+python -m rbs.run --broker <host>    # subscribes rbs/tsync_rx/+, serves to_ref_us
+python -m rbs.report --plot          # per-node residual table + results/fleet_resid.png
+```
+
+**Firmware** — flash two ESP32-S3 boards and watch them sync (see [firmware/README.md](firmware/README.md)):
+```bash
+cd firmware/example && idf.py set-target esp32s3 && idf.py menuconfig   # set node letter/id
+idf.py -p /dev/ttyACM0 flash monitor
+```
 
 ## Hardware
 

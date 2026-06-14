@@ -9,14 +9,25 @@ Plan: `/home/claude/.claude/plans/modular-swinging-meadow.md`
   pytest against the new package; `conftest.py` adds repo root + capture path. **12 passed.**
 - **data/capture_v4.jsonl** — anonymized real capture (268 reports, no MACs).
 
-## In progress / next
-- examples/replay.py — capture → resolver → per-node residual table (no hardware)
-- rbs/service.py — standalone controller (drop Module/ctx); drift persist + perf JSONL
-- rbs/run.py — paho-mqtt runner
-- rbs/report.py — output sync-performance (table + plots)
-- firmware/components/rbs_tsync + firmware/example
-- docs/integration.md (FAQ) + README roadmap update
-- requirements.txt, CI
+## Part A — server: DONE
+- examples/replay.py, rbs/service.py, rbs/run.py, rbs/report.py, requirements.txt.
+  Replay reproduces σ_all 658 → σ_clean 359, drift −7..20 ppm. 12 tests pass.
+
+## Part B — firmware: DONE
+- firmware/components/rbs_tsync (rbs_tsync.c/.h, CMakeLists) — announce + passive-scan
+  RX-stamp + ring + reporter, transport via callback, node-id setter. No Flora/LED/sensor.
+- firmware/example — buildable app (MQTT or UART output), Kconfig, sdkconfig.defaults.
+  **Builds clean on ESP-IDF v5.3.2 / esp32s3 (556 KB).** Gotcha fixed: don't disable
+  NimBLE CENTRAL/PERIPHERAL (ble_adv_reattempt build bug).
+
+## Part D — docs: DONE
+- docs/integration.md (FAQ: live vs offline, drift OLS window, reboot handling),
+  firmware/README.md, README quick-start + layout + status.
+
+## Remaining / optional
+- CI (GitHub Actions) running pytest + replay — nice-to-have.
+- Live end-to-end re-verify against the fleet after firmware work settles.
+- Push to GitHub (user does this).
 
 ## FAQ answers to fold into docs/integration.md
 - Live vs offline: resolver keeps offset+drift model in memory, `to_ref_us()` called as

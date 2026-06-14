@@ -1,3 +1,9 @@
 __pycache__/
 *.pyc
 .DS_Store
+# ESP-IDF build artifacts
+firmware/example/build/
+firmware/example/sdkconfig
+firmware/example/sdkconfig.old
+state/
+*.egg-info/
