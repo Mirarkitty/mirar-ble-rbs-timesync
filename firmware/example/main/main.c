@@ -2,8 +2,12 @@
  *
  * If CONFIG_EXAMPLE_WIFI_SSID is set, connects WiFi + MQTT and publishes reports
  * to the broker (the path the Python server consumes). Otherwise it falls back to
- * printing each report to the UART console — flash two boards (different node
- * letters) and watch the JSON reports stream out, no broker required.
+ * printing each report to the UART console.
+ *
+ * Flash at least THREE boards with distinct node letters (a, b, c). RBS syncs two
+ * nodes only when a third node's emission is co-received by both — a board never
+ * hears its own advertisement, so two boards yield k=1 flashes and the resolver
+ * (MIN_K=2) can't solve any offset.
  */
 #include <stdio.h>
 #include <string.h>

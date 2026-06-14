@@ -39,7 +39,15 @@ CONFIG_SPIRAM=y                          # ring + task stacks (graceful fallback
 Leave `ROLE_CENTRAL`/`ROLE_PERIPHERAL` at their defaults — disabling them trips an
 ESP-IDF v5.3 NimBLE build bug on the broadcaster path. See `example/sdkconfig.defaults`.
 
-## Build & run the example (two boards)
+## Build & run the example (three boards minimum)
+
+**Why three, not two.** RBS syncs two nodes by having them *co-receive the same
+emission from a third node* — the unknown air-time cancels in the receivers'
+difference. A board never hears its own advertisement, so with only two boards every
+flash has exactly one receiver (`k = 1`), the resolver's `MIN_K = 2` is never met, and
+**nothing syncs**. With three boards each node is, in turn, the common transmitter the
+other two both hear, so all three pairwise offsets resolve. More boards → more
+co-receivers per flash → tighter solve.
 
 ```bash
 export IDF_TOOLS_PATH=/opt/esp-idf-tools          # your IDF tools path
@@ -47,18 +55,19 @@ export IDF_TOOLS_PATH=/opt/esp-idf-tools          # your IDF tools path
 cd firmware/example
 idf.py set-target esp32s3
 
-# Board A — node letter 'a', id esp32a:
-idf.py menuconfig        # "rbs_tsync example" → set Node letter/id (and WiFi/MQTT if wanted)
+# Flash three boards, each with a distinct node letter/id:
+idf.py menuconfig        # "rbs_tsync example" → Node letter 'a', id esp32a (+ WiFi/MQTT if wanted)
 idf.py -p /dev/ttyACM0 flash monitor
-
-# Board B — set letter 'b', id esp32b, flash the second board.
+# repeat for letter 'b'/esp32b and letter 'c'/esp32c on the other two boards.
 ```
 
-- **No broker needed**: leave "Publish over WiFi/MQTT" off and each board prints its
-  reports to the UART console — you'll see board A reporting `b` receptions and vice
-  versa once they hear each other (~seconds).
-- **End-to-end with the server**: enable WiFi/MQTT, point both boards at your broker,
-  then run `python -m rbs.run --broker <host>` and `python -m rbs.report --plot`.
+- **No broker needed (reception check)**: leave "Publish over WiFi/MQTT" off and each
+  board prints its reports to the UART console — every board reports receptions of the
+  other two within seconds. This shows the mesh hearing itself, but the *offset solve*
+  runs in the Python server, not on the boards.
+- **End-to-end sync (the real demo)**: enable WiFi/MQTT on all three, point them at your
+  broker, then run `python -m rbs.run --broker <host>` and `python -m rbs.report --plot`.
+  The server needs ≥3 reporting boards before any pair has a `k ≥ 2` flash to solve.
 
 Verified to build clean on ESP-IDF v5.3.2 (ESP32-S3), ~556 KB image.
 

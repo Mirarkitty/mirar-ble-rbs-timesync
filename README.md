@@ -114,7 +114,8 @@ python -m rbs.run --broker <host>    # subscribes rbs/tsync_rx/+, serves to_ref_
 python -m rbs.report --plot          # per-node residual table + results/fleet_resid.png
 ```
 
-**Firmware** — flash two ESP32-S3 boards and watch them sync (see [firmware/README.md](firmware/README.md)):
+**Firmware** — flash three+ ESP32-S3 boards (RBS needs a common transmitter heard by two
+receivers, so two boards can't sync — see [firmware/README.md](firmware/README.md)):
 ```bash
 cd firmware/example && idf.py set-target esp32s3 && idf.py menuconfig   # set node letter/id
 idf.py -p /dev/ttyACM0 flash monitor

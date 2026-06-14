@@ -66,6 +66,31 @@ def test_status_payload_shape(capture_path):
         assert k in sp, f"status_payload missing {k}"
 
 
+def test_two_nodes_cannot_sync():
+    """A node never hears its own beacon, so with only two nodes every flash has a
+    single receiver (k=1 < MIN_K) — no flash closes, nothing syncs."""
+    r = RBSResolver(gauge_node="esp32b", clock=lambda: 1000.0)
+    # esp32a hears esp32b's emissions; esp32b hears esp32a's. Each flash: 1 receiver.
+    for i in range(20):
+        r.ingest_report("esp32a", 1, [["b", 2, 1000.0 + i, 5000.0 + i, -60]], wall=1000.0)
+        r.ingest_report("esp32b", 2, [["a", 1, 2000.0 + i, 6000.0 + i, -60]], wall=1000.0)
+    r.tick(wall=1000.0, flush=True)
+    assert len(r._closed_flashes) == 0, "two nodes must yield no co-received (k>=2) flashes"
+
+
+def test_three_nodes_close_flashes():
+    """Three nodes: each node's emission is co-received by the other two (k=2),
+    so flashes close and pairwise offsets can be solved."""
+    r = RBSResolver(gauge_node="esp32c", clock=lambda: 1000.0)
+    for i in range(20):
+        txus = 1000.0 + i
+        # esp32c emits flash txus; BOTH a and b receive that same emission → k=2
+        r.ingest_report("esp32a", 1, [["c", 3, txus, 5000.0 + i, -60]], wall=1000.0)
+        r.ingest_report("esp32b", 2, [["c", 3, txus, 5200.0 + i, -60]], wall=1000.0)
+    r.tick(wall=1000.0, flush=True)
+    assert len(r._closed_flashes) >= 1, "co-received emissions should close flashes"
+
+
 if __name__ == "__main__":  # manual run: prints a quick summary
     import sys
     cap = sys.argv[1] if len(sys.argv) > 1 else \

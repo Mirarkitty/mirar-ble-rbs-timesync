@@ -41,6 +41,13 @@ server, a set of receivers all timestamp the **same broadcast event** and then c
 The transmitter's clock and the emission instant **drop out**. We never need to know when
 the packet was sent or how long it flew — only that every receiver heard *the same one*.
 
+**Minimum of three nodes.** The constraint that ties two clocks together is "these two
+nodes both heard the same emission." A node never hears its own advertisement, so two
+nodes produce only single-receiver flashes (`k = 1`) and zero constraints — two boards
+cannot sync. Three is the floor: each node in turn is the common transmitter the other
+two co-receive, yielding all three pairwise offsets. Every additional node adds
+co-receivers per flash and tightens the solve (the live fleet medians ~5 receivers each).
+
 ## Mapping RBS onto hardware we already run
 
 Every node in this fleet already BLE-advertises its identity roughly every 1.5 s — that
