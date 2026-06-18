@@ -628,6 +628,11 @@ class RBSResolver:
             gm = self._models[gk]
             gm.offset_us = 0.0
             gm.drift_ppm = 0.0
+            # The gauge IS the reference frame: drift exactly 0 with ZERO uncertainty. Pin p11=0
+            # too — else sigma_at()'s √p11·Δt term explodes (the gauge is never re-anchored, so its
+            # (local−anchor) grows to the full boot uptime, and its drift is never fit → p11 stuck
+            # at the 50 ppm prior → a bogus ~seconds σ on the best-synced node).
+            gm.p11 = 0.0
             if gm.sigma_us > 1e8:
                 gm.sigma_us = self._sigma_clean or RAW_JITTER_US
 

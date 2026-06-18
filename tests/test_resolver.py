@@ -92,6 +92,25 @@ def test_three_nodes_close_flashes():
     assert len(r._closed_flashes) >= 1, "co-received emissions should close flashes"
 
 
+def test_gauge_sigma_at_does_not_explode():
+    """The gauge node defines the reference (drift 0, zero uncertainty): _pin_gauge must pin
+    p11=0 so sigma_at() doesn't blow up via √p11·Δt — the gauge is never re-anchored, so Δt =
+    full boot uptime (~hours). Regression for the ~1.7 s gauge σ seen live."""
+    r = RBSResolver(gauge_node="esp32c", clock=lambda: 1000.0)
+    # esp32c (gauge) emits; a and b co-receive at a LARGE local rx (hours of esp_timer uptime).
+    big = 34_000_000_000.0      # ~9.4 h of esp_timer µs — the regime that exploded
+    for i in range(20):
+        txus = big + i
+        r.ingest_report("esp32a", 1, [["c", 3, txus, big + 5000.0 + i, -60]], wall=1000.0)
+        r.ingest_report("esp32b", 2, [["c", 3, txus, big + 5200.0 + i, -60]], wall=1000.0)
+    r.tick(wall=1000.0, flush=True)
+    gm = r._models[("esp32c", 3)]
+    assert gm.p11 == 0.0, "gauge p11 must be pinned to 0"
+    # sigma_at far from anchor must equal the offset floor, not explode
+    assert gm.sigma_at(big + 1e9) == gm.sigma_us
+    assert r.drift_sigma_ppm("esp32c", 3) == 0.0
+
+
 def test_sigma_at_grows_with_gap():
     """Time-aware σ: equals the offset floor at the anchor, grows by √p11·Δt over a gap."""
     m = ClockModel("esp32a", 1, anchor_us=1_000_000.0, wall=1000.0)
