@@ -7,11 +7,12 @@ reference instant? (to_ref_i(rx_i) ≈ to_ref_j(rx_j)). That residual is the
 achievable inter-node sync error. Also sanity-checks drift.
 """
 import json
+import math
 import statistics as st
 
 import numpy as np
 
-from rbs.resolver import RBSResolver
+from rbs.resolver import RBSResolver, ClockModel
 
 
 def _replay(capture_path):
@@ -89,6 +90,42 @@ def test_three_nodes_close_flashes():
         r.ingest_report("esp32b", 2, [["c", 3, txus, 5200.0 + i, -60]], wall=1000.0)
     r.tick(wall=1000.0, flush=True)
     assert len(r._closed_flashes) >= 1, "co-received emissions should close flashes"
+
+
+def test_sigma_at_grows_with_gap():
+    """Time-aware σ: equals the offset floor at the anchor, grows by √p11·Δt over a gap."""
+    m = ClockModel("esp32a", 1, anchor_us=1_000_000.0, wall=1000.0)
+    m.sigma_us = 60.0           # offset floor (µs)
+    m.p11 = 0.25                # drift variance = (0.5 ppm)²
+    # at the anchor, Δt=0 → σ == offset floor
+    assert math.isclose(m.sigma_at(1_000_000.0), 60.0, rel_tol=1e-9)
+    # 100 s later: √(60² + 0.25·100²) = √(3600 + 2500) = √6100 ≈ 78.1 µs
+    assert math.isclose(m.sigma_at(1_000_000.0 + 100e6), math.sqrt(6100.0), rel_tol=1e-9)
+    # strictly increasing with |Δt|, and symmetric
+    s = [m.sigma_at(1_000_000.0 + dt * 1e6) for dt in (0, 10, 50, 200)]
+    assert s == sorted(s) and all(b > a for a, b in zip(s, s[1:]))
+    assert math.isclose(m.sigma_at(1_000_000.0 - 50e6), m.sigma_at(1_000_000.0 + 50e6))
+
+
+def test_clock_params_and_drift_sigma():
+    """The stamping API returns ref + time-aware σ + drift + drift σ, gated on validity."""
+    r = RBSResolver(clock=lambda: 1000.0)
+    m = ClockModel("esp32a", 7, anchor_us=2_000_000.0, wall=1000.0)
+    m.offset_us, m.drift_ppm, m.sigma_us, m.p11, m.valid = 1234.0, 2.0, 50.0, 0.16, True
+    r._models[("esp32a", 7)] = m
+
+    p = r.clock_params("esp32a", 7, 2_000_000.0)
+    assert math.isclose(p["ref_us"], m.to_ref_us(2_000_000.0))
+    assert math.isclose(p["sigma_us"], 50.0)                 # Δt=0 → floor
+    assert p["drift_ppm"] == 2.0
+    assert math.isclose(p["drift_sigma_ppm"], math.sqrt(0.16))   # = 0.4
+    # sigma_us(at_local) is time-aware; without it, the anchor floor
+    assert r.sigma_us("esp32a", 7, at_local_us=2_000_000.0 + 100e6) > r.sigma_us("esp32a", 7)
+    # invalid model → None / 1e9
+    m.valid = False
+    assert r.clock_params("esp32a", 7, 2_000_000.0) is None
+    assert r.drift_sigma_ppm("esp32a", 7) is None
+    assert r.sigma_us("esp32a", 7) == 1e9
 
 
 if __name__ == "__main__":  # manual run: prints a quick summary

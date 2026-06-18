@@ -134,6 +134,16 @@ class ClockModel:
     def to_ref_us(self, local_us: float) -> float:
         return local_us + self.offset_us + self.drift_ppm * (local_us - self.anchor_us) / 1e6
 
+    def sigma_at(self, local_us: float) -> float:
+        """Time-aware 1σ of to_ref_us(local_us): the anchor-time offset σ grown by the
+        drift-extrapolation term √p11·Δt over the gap from the anchor to the query.
+          σ(t) = √( sigma_us²  +  p11 · ((t − anchor_us)/1e6)² )
+        Δt small (query ≈ anchor, active sync) ⇒ ≈ sigma_us (the offset floor); a long
+        coverage gap ⇒ grows with the drift uncertainty (√p11 ppm = µs/s, × Δt s = µs).
+        sigma_us is floored at 50 µs and p11 at (0.2 ppm)², so this never claims sub-50 µs."""
+        dt_s = (float(local_us) - self.anchor_us) / 1e6
+        return math.sqrt(self.sigma_us * self.sigma_us + self.p11 * dt_s * dt_s)
+
     # ── re-anchor (keeps the drift-extrapolation horizon small) ───────
     def reanchor(self, new_anchor_us):
         """Move the anchor to a recent rx (offset += drift·Δt to stay continuous).
@@ -694,9 +704,34 @@ class RBSResolver:
             return m.to_ref_us(float(local_us))
 
     def sigma_us(self, node, boot, at_local_us=None):
+        """Per-node 1σ offset precision (µs). With at_local_us, returns the time-aware
+        σ(t) = √(sigma_us² + p11·Δt²) (grows through a coverage gap); without it, the
+        anchor-time floor. 1e9 if the model isn't valid."""
         with self._lock:
             m = self._models.get((node, boot))
-            return m.sigma_us if (m and m.valid) else 1e9
+            if not (m and m.valid):
+                return 1e9
+            return m.sigma_at(float(at_local_us)) if at_local_us is not None else m.sigma_us
+
+    def drift_sigma_ppm(self, node, boot):
+        """1σ uncertainty of the per-node drift estimate (ppm) = √p11. Bounds the
+        residual delay-rate error a Doppler consumer inherits after drift correction."""
+        with self._lock:
+            m = self._models.get((node, boot))
+            return math.sqrt(m.p11) if (m and m.valid) else None
+
+    def clock_params(self, node, boot, local_us):
+        """Atomic best-estimate + precision for stamping a sample at capture:
+          {ref_us, sigma_us (time-aware at local_us), drift_ppm, drift_sigma_ppm}
+        or None if the model isn't valid. Must be called LIVE — anchor_us/p11 cannot be
+        reconstructed offline (the model re-anchors forward; closed boots are GC'd)."""
+        with self._lock:
+            m = self._models.get((node, boot))
+            if not (m and m.valid):
+                return None
+            lu = float(local_us)
+            return {"ref_us": m.to_ref_us(lu), "sigma_us": m.sigma_at(lu),
+                    "drift_ppm": m.drift_ppm, "drift_sigma_ppm": math.sqrt(m.p11)}
 
     def current_boot(self, node):
         with self._lock:
