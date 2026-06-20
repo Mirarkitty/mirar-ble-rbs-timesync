@@ -4,8 +4,15 @@ This project is the **timing layer**: it turns the BLE reference-broadcast mesh 
 per-node clock model and exposes one primitive,
 
 ```python
-to_ref_us(node, boot, local_us) -> float | None   # None until the node has converged
+to_ref_us(node, boot, local_us) -> float | None   # None until converged OR if off-gauge
 ```
+
+It returns `None` in two cases: while the node is still converging (~60–90 s after a
+reboot), **and** when the node is not in the gauge's connected component (a graph split —
+see [how-it-works.md](how-it-works.md)). Both mean "no trustworthy reference time for this
+node right now" — treat `None` identically: skip the sample / flag it, never substitute a
+fallback. To compare two nodes for TDOA, require both `to_ref_us` non-`None` (equivalently:
+same `component` in `node_status`); `status_payload()["n_components"] > 1` flags a live split.
 
 which maps a node's local `esp_timer` microseconds onto a shared reference timeline. What
 you build on top — acoustic TDOA, event correlation, anything that needs a common clock —

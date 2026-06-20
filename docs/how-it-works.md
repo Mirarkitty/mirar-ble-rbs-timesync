@@ -88,12 +88,30 @@ A server process subscribes to all `espbt/tsync_rx/+` reports and maintains, per
 `(node, boot)` epoch, a small model:
 
 ```
-ClockModel { offset_us, drift_ppm, sigma_us, n_flashes, valid }
+ClockModel { offset_us, drift_ppm, sigma_us, n_flashes, valid, component, tied_to_gauge }
 ```
 
-One node (here `esp32h`) is the **gauge anchor**: its offset is 0 by definition, and every
-other node's offset is computed relative to it. (The choice is arbitrary — TDOA only needs
-*relative* time; absolute time is unobservable and unnecessary.)
+One node is the **gauge anchor**: its offset is 0 by definition, and every other node's
+offset is computed relative to it. (The choice is arbitrary — TDOA only needs *relative*
+time; absolute time is unobservable and unnecessary.)
+
+The anchor is **chosen per solve from the live co-observation graph**, not hardwired: the
+configured gauge (`esp32h`) if it is in the largest connected component, otherwise that
+component's highest-degree node. This matters because the graph can **fragment** — if two
+groups of nodes stop sharing any flash (e.g. a marginal cross-floor link), the least-squares
+splits into disconnected islands. Only the anchor's island has a meaningful offset; a
+detached island would otherwise get an arbitrary (min-norm) gauge whose cross-island
+`to_ref` is silently wrong by ~hours (≈ the difference in the islands' boot uptimes). So:
+
+- each model carries a **`component`** id (the anchor's is `0`) and **`tied_to_gauge`**;
+- a node outside the anchor's component is **not `valid`** → `to_ref_us` returns `None`
+  (an honest "unknown") instead of a wrong number, and re-validates the instant a shared
+  flash re-bridges it;
+- `status_payload()` reports **`n_components`** / `split` / `effective_anchor` so a split is
+  observable, not silent.
+
+A consumer comparing two nodes for TDOA must check they share a `component` (or simply rely
+on `to_ref_us` returning `None` for the untied one).
 
 Two estimation levers do the real work, each documented in its own page:
 

@@ -73,6 +73,12 @@ STALE_S                = 300.0   # node silent longer than this ⇒ model no lon
 # feeding a silent node stale windowed measurements (broke gap detection AND drove
 # the KF to diverge during sparse periods).
 FRESH_S                = 8.0
+# esp_timer is monotone WITHIN a boot, so a large backward rx jump for an already
+# established (node,boot) means the node rebooted but its 8-bit boot nonce COLLIDED
+# with this epoch's (1/256). Reset the model in place so a stale frame — especially
+# a stale GAUGE — cannot survive an invisible reboot. 60 s ≫ any out-of-order flash
+# reordering (bounded by FLASH_COLLECT_S), so this can't false-fire.
+REBOOT_BACKSTEP_US     = 60e6
 VALID_MAX_SIGMA_US     = 5_000.0 # σ above this ⇒ model considered unfit
 EPOCH_ARCHIVE_S        = 600.0   # keep a closed epoch this long for stragglers
 GAUGE_NODE             = "esp32h"
@@ -110,7 +116,7 @@ class ClockModel:
     cross-reboot drift prior)."""
     __slots__ = ("node", "boot", "anchor_us", "offset_us", "drift_ppm",
                  "sigma_us", "n_flashes", "created_wall", "last_update_wall",
-                 "last_rx_us", "last_heard_wall", "valid",
+                 "last_rx_us", "last_heard_wall", "valid", "component", "tied_to_gauge",
                  "p11", "drift_seeded", "swap_strikes")
 
     def __init__(self, node, boot, anchor_us, wall):
@@ -126,6 +132,8 @@ class ClockModel:
         self.last_rx_us = float(anchor_us)
         self.last_heard_wall = wall          # wall time of the last FRESH flash
         self.valid = False
+        self.component = 0                    # connected-component id (gauge's == 0)
+        self.tied_to_gauge = True             # in the gauge's component → frame-comparable
         # drift estimate variance — prior ±50 ppm until a slope is fit
         self.p11 = float(DRIFT_PRIOR_PPM ** 2)
         self.drift_seeded = False    # drift carried from a per-node prior across reboot
@@ -168,6 +176,8 @@ class ClockModel:
             "converging": (not self.valid) and self.sigma_us < 1e8,
             "age_s": round(_time.time() - self.created_wall, 1),
             "drift_seeded": self.drift_seeded,
+            "component": self.component,
+            "tied_to_gauge": self.tied_to_gauge,
         }
 
     _PERSIST = ("node", "boot", "anchor_us", "offset_us", "drift_ppm", "sigma_us",
@@ -230,6 +240,11 @@ class RBSResolver:
         self._fleet_state = "normal"
         self._n_reports = 0
         self._n_flashes_closed = 0
+        # frame anchor + connected-component map chosen each solve from the live
+        # co-observation graph (robust gauge — see _choose_anchor).
+        self._anchor_key = None                     # (node,boot) the frame is pinned to
+        self._components: dict = {}                  # (node,boot) -> component id (anchor's == 0)
+        self._n_components = 1
 
     # ── ingest ────────────────────────────────────────────────────────
     def ingest_report(self, reporter: str, reporter_boot: int, entries, wall=None):
@@ -314,9 +329,33 @@ class RBSResolver:
                 if m.anchor_us == 0.0:        # first time heard — anchor HERE, else the
                     m.anchor_us = rx          # first reanchor would be dt≈rx/1e6 (~1e4s)
                     m.last_rx_us = rx         # and coast offset by drift·1e4 (bogus jump)
+                elif rx < m.last_rx_us - REBOOT_BACKSTEP_US and (wall - m.created_wall) > FRESH_S:
+                    self._reset_epoch_inplace(m, rx, wall)   # hidden reboot (nonce collision)
                 m.last_heard_wall = wall
-                if rx > m.last_rx_us:          # latest rx (KF re-anchor point)
+                if rx > m.last_rx_us:          # latest rx (re-anchor point)
                     m.last_rx_us = rx
+
+    def _reset_epoch_inplace(self, m, rx, wall):
+        """A node rebooted but reused its boot nonce (1/256 collision) → its
+        esp_timer restarted from 0 while we still hold the old model. Re-initialise
+        to the new epoch: offset re-acquires from scratch, drift re-seeds from the
+        per-node prior. Prevents a stale frame — notably a stale GAUGE — from
+        surviving an invisible reboot."""
+        m.anchor_us = rx
+        m.last_rx_us = rx
+        m.offset_us = 0.0
+        m.sigma_us = 1e9
+        m.n_flashes = 0
+        m.created_wall = wall
+        m.last_update_wall = wall
+        m.valid = False
+        prior = self._drift_prior.get(m.node)
+        if prior is not None:
+            m.drift_ppm, m.p11, m.drift_seeded = float(prior[0]), DRIFT_SEED_P11_PPM2, True
+        else:
+            m.drift_ppm, m.p11, m.drift_seeded = 0.0, float(DRIFT_PRIOR_PPM ** 2), False
+        self._epoch_log.append({"t": wall, "node": m.node, "boot": m.boot,
+                                "reepoch": True, "seeded": prior is not None})
 
     def _flash_spread(self, rxmap) -> float:
         """Internal tightness of one flash: MAD of to_ref_us across its receivers
@@ -396,22 +435,24 @@ class RBSResolver:
     # ── the global solves ─────────────────────────────────────────────
     def _solve(self, wall):
         self._tick_diag = {}
-        # Re-anchor every node to its latest rx BEFORE measuring (BOTH modes), so
-        # the drift-extrapolation horizon stays small (else huge esp_timer rx ×
-        # frozen anchor amplifies drift noise into ms offset swings). KF also grows
-        # covariance here.
+        # Choose the frame anchor FIRST, so every step below pins/skips the same node.
+        self._choose_anchor(wall)
+        # Re-anchor every node to its latest rx BEFORE measuring, so the
+        # drift-extrapolation horizon stays small (else huge esp_timer rx × frozen
+        # anchor amplifies drift noise into ms offset swings).
         self._reanchor_all()
         self._fuse_drift(self._solve_drift(wall))          # drift first (offset dc needs it)
-        # Offsets are only meaningful relative to a HEARD gauge. If the gauge node
-        # isn't fresh (startup right after a restore before esp32h is re-heard, or a
-        # gauge gap), the solve would pin the frame to a fallback node — a DIFFERENT
-        # frame than the (restored) offsets, a gross transient that tripped the guard.
-        # Skip offset fusion until the frame is anchored; restored offsets are preserved.
+        # Offsets are only meaningful relative to a HEARD anchor. The anchor is now
+        # the highest-degree node of the largest component (NOT a fixed leaf), so a
+        # single node dropping out can neither halt the solve nor freeze a split.
+        # Still skip if even that anchor is silent (nothing co-observed this tick);
+        # restored/coasted offsets are preserved.
         gk = self._gauge_key()
         gm = self._models.get(gk) if gk else None
         if gm is not None and (wall - gm.last_heard_wall) < FRESH_S:
-            off, edges, eps = self._solve_offset(wall)
+            off, edges, eps, pair_keys = self._solve_offset(wall)
             self._fuse_offset(off, edges, eps, wall)
+            self._label_components(pair_keys)   # components from the ACTUAL solved graph
         self._pin_gauge()
         self._update_validity(wall)
 
@@ -425,11 +466,93 @@ class RBSResolver:
     def _active_models(self):
         return {k: m for k, m in self._models.items() if k not in self._archived}
 
-    def _gauge_key(self):
-        # the gauge node's current (node,boot); fall back to any node if absent
+    @staticmethod
+    def _connected_components(adj):
+        """(comp_map {key:raw_id}, comps [members,...]) from an adjacency dict."""
+        comp, comps = {}, []
+        for start in adj:
+            if start in comp:
+                continue
+            comp[start] = len(comps); stack, members = [start], []
+            while stack:
+                u = stack.pop(); members.append(u)
+                for v in adj[u]:
+                    if v not in comp:
+                        comp[v] = len(comps); stack.append(v)
+            comps.append(members)
+        return comp, comps
+
+    def _choose_anchor(self, wall):
+        """Pick the offset-frame anchor from the live co-observation graph: the
+        configured gauge IF present AND in the largest component; otherwise the
+        highest-degree node of the largest component (tie-break: configured-gauge
+        node name, then name). Keeping the frame on a well-connected node is the
+        durable fix for gauge fragmentation — the sole floor-0 mic (or any leaf)
+        dropping out can no longer halt the whole solve nor strand the rest as an
+        un-anchored min-norm island that a restart then freezes in."""
+        adj, deg = {}, {}
+        for (ki, kj) in self._pair_samples(wall):        # OFFSET-window co-observation
+            if ki not in self._models or kj not in self._models:
+                continue
+            adj.setdefault(ki, set()).add(kj)
+            adj.setdefault(kj, set()).add(ki)
+            deg[ki] = deg.get(ki, 0) + 1
+            deg[kj] = deg.get(kj, 0) + 1
+        comp, comps = self._connected_components(adj)
+        anchor = None
+        if comps:
+            largest = max(comps, key=len)
+            gk_cur = self._configured_gauge_key()
+            if gk_cur is not None and comp.get(gk_cur) == comp[largest[0]]:
+                anchor = gk_cur                          # configured gauge is in the big island
+            else:
+                anchor = max(largest, key=lambda k: (deg.get(k, 0), k[0] == self._gauge, k[0]))
+        if anchor is None:                               # no edges yet (startup) — fall back
+            anchor = self._configured_gauge_key() or next(iter(self._active_models()), None)
+        self._anchor_key = anchor
+
+    def _label_components(self, pair_keys):
+        """Label components from the ACTUAL solved constraint graph (the clean,
+        tightness-filtered pairs the gauge-solve used — NOT the broader co-observation
+        set), so a pair bridged only by DIRTY flashes that the solve min-norm-floats
+        is correctly a SEPARATE component (the marginal cross-floor case). Anchor's
+        component is renumbered to 0 (== tied_to_gauge); silent models keep their
+        last label."""
+        adj = {}
+        for (ki, kj) in pair_keys:
+            adj.setdefault(ki, set()).add(kj)
+            adj.setdefault(kj, set()).add(ki)
+        comp, comps = self._connected_components(adj)
+        anchor = self._anchor_key
+        anchor_raw = comp.get(anchor)
+        order = sorted(range(len(comps)), key=lambda c: (c != anchor_raw, -len(comps[c])))
+        remap = {old: new for new, old in enumerate(order)}
+        self._components = {k: remap[c] for k, c in comp.items()}
+        if anchor is not None and anchor not in self._components:
+            self._components[anchor] = 0                 # isolated anchor is its own component 0
+        self._n_components = max(1, len(comps))
+        for key, cid in self._components.items():
+            m = self._models.get(key)
+            if m is not None:
+                m.component = cid
+                m.tied_to_gauge = (cid == 0)
+
+    def _configured_gauge_key(self):
+        # the CONFIGURED gauge node's current (node,boot), or None if absent.
         b = self._cur_boot.get(self._gauge)
         if b is not None and (self._gauge, b) in self._models:
             return (self._gauge, b)
+        return None
+
+    def _gauge_key(self):
+        # the EFFECTIVE frame anchor chosen this solve (robust, graph-aware). Before
+        # the first solve / on a bare restore, fall back to the configured gauge,
+        # else any active node.
+        if self._anchor_key is not None and self._anchor_key in self._models:
+            return self._anchor_key
+        gk = self._configured_gauge_key()
+        if gk is not None:
+            return gk
         act = self._active_models()
         return next(iter(act)) if act else None
 
@@ -500,11 +623,12 @@ class RBSResolver:
 
     def _solve_offset(self, wall):
         """Per-node offset measurements (off_i − off_j RBS), with the one-sided
-        tightness lever. Returns ({key: z_offset}, edges, sigma_eps) WITHOUT
-        mutating models, so the KF fuse step owns the state."""
+        tightness lever. Returns ({key: z_offset}, edges, sigma_eps, pair_keys)
+        WITHOUT mutating models. pair_keys = the (ki,kj) actually constrained this
+        tick → the graph used for component labels."""
         all_pairs = self._pair_samples(wall)
         if not all_pairs:
-            return {}, {}, RAW_JITTER_US
+            return {}, {}, RAW_JITTER_US, set()
         prov, _ = self._offset_from_pairs(all_pairs)   # provisional, not assigned
         # rank flashes by internal tightness (for selection)
         spreads = [(self._flash_spread_prov(rxmap, prov), key)
@@ -524,7 +648,9 @@ class RBSResolver:
             self._sigma_clean = self._sigma_all
             pairs = all_pairs
         offs, edges = self._offset_from_pairs(pairs)
-        return offs, edges, (self._sigma_clean or RAW_JITTER_US)
+        pair_keys = {(ki, kj) for (ki, kj) in pairs
+                     if ki in self._models and kj in self._models}
+        return offs, edges, (self._sigma_clean or RAW_JITTER_US), pair_keys
 
     def _pooled_sigma(self, prov, keys):
         """STD of the POOLED per-receiver residuals across the given flashes — the
@@ -672,7 +798,11 @@ class RBSResolver:
             offset_ok = m.n_flashes >= CONVERGE_MIN_FLASHES and m.sigma_us < VALID_MAX_SIGMA_US
             converged = offset_ok and (m.drift_seeded or age >= CONVERGE_S)
             stale = (wall - m.last_heard_wall) > STALE_S
-            m.valid = bool((converged or key == gk) and not stale)
+            # A node NOT in the gauge's connected component has only a min-norm
+            # (arbitrary-level) offset — its cross-frame to_ref is meaningless. Mark
+            # it invalid so to_ref_us returns None instead of silent garbage; it
+            # re-validates the moment a shared flash re-bridges it into component 0.
+            m.valid = bool((converged or key == gk) and not stale and m.tied_to_gauge)
         self._update_drift_priors(wall)
 
     def _update_drift_priors(self, wall):
@@ -815,6 +945,9 @@ class RBSResolver:
                 "nodes": self.all_node_status(),
                 "fleet_state": self._fleet_state,
                 "gauge_anchor": self._gauge,
+                "effective_anchor": self._anchor_key[0] if self._anchor_key else None,
+                "n_components": self._n_components,
+                "split": self._n_components > 1,
                 "flashes_closed": self._n_flashes_closed,
                 "reports": self._n_reports,
                 "median_flash_sigma_us": round(float(np.median(sigs)), 1) if sigs else None,

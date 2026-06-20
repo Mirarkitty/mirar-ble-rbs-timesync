@@ -93,17 +93,27 @@ def test_three_nodes_close_flashes():
 
 
 def test_gauge_sigma_at_does_not_explode():
-    """The gauge node defines the reference (drift 0, zero uncertainty): _pin_gauge must pin
-    p11=0 so sigma_at() doesn't blow up via √p11·Δt — the gauge is never re-anchored, so Δt =
-    full boot uptime (~hours). Regression for the ~1.7 s gauge σ seen live."""
+    """The frame anchor defines the reference (drift 0, zero uncertainty): _pin_gauge must pin
+    p11=0 so sigma_at() doesn't blow up via √p11·Δt — the anchor is never re-anchored, so Δt =
+    full boot uptime (~hours). Regression for the ~1.7 s gauge σ seen live.
+
+    esp32c is the configured gauge AND a co-observer here (it both emits and receives), so it
+    sits in the connected component and is legitimately the anchor. (A transmit-only node has an
+    unobservable offset and is NOT eligible to anchor the frame — see test_split_*.)"""
     r = RBSResolver(gauge_node="esp32c", clock=lambda: 1000.0)
-    # esp32c (gauge) emits; a and b co-receive at a LARGE local rx (hours of esp_timer uptime).
-    big = 34_000_000_000.0      # ~9.4 h of esp_timer µs — the regime that exploded
+    # {a,b,c} co-observe at a LARGE local rx (hours of esp_timer uptime) — the regime that exploded.
+    big = 34_000_000_000.0      # ~9.4 h of esp_timer µs
+    boots = {"esp32a": 1, "esp32b": 2, "esp32c": 3}
     for i in range(20):
-        txus = big + i
-        r.ingest_report("esp32a", 1, [["c", 3, txus, big + 5000.0 + i, -60]], wall=1000.0)
-        r.ingest_report("esp32b", 2, [["c", 3, txus, big + 5200.0 + i, -60]], wall=1000.0)
+        for tx in ("a", "b", "c"):
+            txus = big + i
+            for rn in ("esp32a", "esp32b", "esp32c"):
+                if rn[-1] == tx:
+                    continue
+                r.ingest_report(rn, boots[rn], [[tx, boots["esp32" + tx], txus, big + 5000.0 + i, -60]],
+                                wall=1000.0)
     r.tick(wall=1000.0, flush=True)
+    assert r._anchor_key == ("esp32c", 3), "configured gauge in the component must be the anchor"
     gm = r._models[("esp32c", 3)]
     assert gm.p11 == 0.0, "gauge p11 must be pinned to 0"
     # sigma_at far from anchor must equal the offset floor, not explode
